@@ -5,7 +5,7 @@ from env.robot_arm_env import ArmStack
 # from fetch_stack import FetchStackEnv
 
 import gym
-from gym.wrappers import FlattenDictWrapper
+from gym.wrappers import FlattenObservation
 from utils.monitor import Monitor
 from utils.wrapper import DoneOnSuccessWrapper, SwitchGoalWrapper
 import subprocess
@@ -40,7 +40,8 @@ def make_env(env_id, rank, log_dir=None, done_when_success=False, allow_switch_g
         from utils.wrapper import FlexibleTimeLimitWrapper
         env = FlexibleTimeLimitWrapper(env)
     if flatten_dict:
-        env = FlattenDictWrapper(env, ['observation', 'achieved_goal', 'desired_goal'])
+        #env = FlattenObservation(env, ['observation', 'achieved_goal', 'desired_goal'])
+        env = FlattenObservation(env)
     if done_when_success:
         reward_offset = 0
         env = DoneOnSuccessWrapper(env, reward_offset)
