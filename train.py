@@ -1,231 +1,233 @@
-import numpy as np
-import torch
 import argparse
+import difflib
+import importlib
 import os
-import math
-import gym
-import sys
-import random
 import time
-import json
-import copy
+import uuid
 
-import utils.utils as utils
-from utils.make_env import arg_parse, get_env_kwargs, make_env
-from logger import Logger
-from video import VideoRecorder
+import gym
+import numpy as np
+import seaborn
+import torch as th
+from stable_baselines3.common.utils import set_random_seed
 
-from sac_ae import SacAeAgent
+# Register custom envs
+import utils.import_envs  # noqa: F401 pytype: disable=import-error
+from utils.exp_manager import ExperimentManager
+from utils.utils import ALGOS, StoreDict
 
+seaborn.set()
 
-def parse_args():
+if __name__ == "__main__":  # noqa: C901
     parser = argparse.ArgumentParser()
-    # environment
-    parser.add_argument('--env', default='BulletStack-v1')
-    parser.add_argument('--action_repeat', default=1, type=int)
-    parser.add_argument('--frame_stack', default=3, type=int)
-    # replay buffer
-    parser.add_argument('--replay_buffer_capacity', default=1000000, type=int)
-    # train
-    parser.add_argument('--agent', default='sac_ae', type=str)
-    parser.add_argument('--init_steps', default=1000, type=int)
-    parser.add_argument('--num_train_steps', default=100000, type=int)
-    parser.add_argument('--batch_size', default=128, type=int)
-    parser.add_argument('--hidden_dim', default=1024, type=int)
-    # eval
-    parser.add_argument('--eval_freq', default=10000, type=int)
-    parser.add_argument('--num_eval_episodes', default=10, type=int)
-    # critic
-    parser.add_argument('--critic_lr', default=1e-3, type=float)
-    parser.add_argument('--critic_beta', default=0.9, type=float)
-    parser.add_argument('--critic_tau', default=0.01, type=float)
-    parser.add_argument('--critic_target_update_freq', default=2, type=int)
-    # actor
-    parser.add_argument('--actor_lr', default=1e-3, type=float)
-    parser.add_argument('--actor_beta', default=0.9, type=float)
-    parser.add_argument('--actor_log_std_min', default=-10, type=float)
-    parser.add_argument('--actor_log_std_max', default=2, type=float)
-    parser.add_argument('--actor_update_freq', default=2, type=int)
-    # encoder/decoder
-    parser.add_argument('--encoder_type', default='identity', type=str)
-    parser.add_argument('--encoder_feature_dim', default=50, type=int)
-    parser.add_argument('--encoder_lr', default=1e-3, type=float)
-    parser.add_argument('--encoder_tau', default=0.05, type=float)
-    parser.add_argument('--num_layers', default=4, type=int)
-    parser.add_argument('--num_filters', default=32, type=int)
-    # sac
-    parser.add_argument('--discount', default=0.99, type=float)
-    parser.add_argument('--init_temperature', default=0.1, type=float)
-    parser.add_argument('--alpha_lr', default=1e-4, type=float)
-    parser.add_argument('--alpha_beta', default=0.5, type=float)
-    # misc
-    parser.add_argument('--seed', default=1, type=int)
-    parser.add_argument('--work_dir', default='.', type=str)
-    parser.add_argument('--save_tb', default=False, action='store_true')
-    parser.add_argument('--save_model', default=False, action='store_true')
-    parser.add_argument('--save_buffer', default=False, action='store_true')
-    parser.add_argument('--save_video', default=False, action='store_true')
-    # stack
-    parser.add_argument('--robot', choices=['panda'], default='panda')
-    parser.add_argument('--allow_rotation', action="store_true", default=False,
-                        help="Whether to enable rotation around z axis in action space.")
-    parser.add_argument('--reward_type', type=str, default='sparse')
-    parser.add_argument('--n_object', type=int, default=2)
-    parser.add_argument('--n_to_stack', type=int, nargs='+', default=1)
-    parser.add_argument('--log_path', default=None, type=str)
-
+    parser.add_argument("--algo", help="RL Algorithm", default="ppo", type=str, required=False, choices=list(ALGOS.keys()))
+    parser.add_argument("--env", type=str, default="CartPole-v1", help="environment ID")
+    parser.add_argument("-tb", "--tensorboard-log", help="Tensorboard log dir", default="", type=str)
+    parser.add_argument("-i", "--trained-agent", help="Path to a pretrained agent to continue training", default="", type=str)
+    parser.add_argument(
+        "--truncate-last-trajectory",
+        help="When using HER with online sampling the last trajectory "
+        "in the replay buffer will be truncated after reloading the replay buffer.",
+        default=True,
+        type=bool,
+    )
+    parser.add_argument("-n", "--n-timesteps", help="Overwrite the number of timesteps", default=-1, type=int)
+    parser.add_argument("--num-threads", help="Number of threads for PyTorch (-1 to use default)", default=-1, type=int)
+    parser.add_argument("--log-interval", help="Override log interval (default: -1, no change)", default=-1, type=int)
+    parser.add_argument(
+        "--eval-freq",
+        help="Evaluate the agent every n steps (if negative, no evaluation). "
+        "During hyperparameter optimization n-evaluations is used instead",
+        default=10000,
+        type=int,
+    )
+    parser.add_argument(
+        "--optimization-log-path",
+        help="Path to save the evaluation log and optimal policy for each hyperparameter tried during optimization. "
+        "Disabled if no argument is passed.",
+        type=str,
+    )
+    parser.add_argument("--eval-episodes", help="Number of episodes to use for evaluation", default=5, type=int)
+    parser.add_argument("--n-eval-envs", help="Number of environments for evaluation", default=1, type=int)
+    parser.add_argument("--save-freq", help="Save the model every n steps (if negative, no checkpoint)", default=-1, type=int)
+    parser.add_argument(
+        "--save-replay-buffer", help="Save the replay buffer too (when applicable)", action="store_true", default=False
+    )
+    parser.add_argument("-f", "--log-folder", help="Log folder", type=str, default="logs")
+    parser.add_argument("--seed", help="Random generator seed", type=int, default=-1)
+    parser.add_argument("--vec-env", help="VecEnv type", type=str, default="dummy", choices=["dummy", "subproc"])
+    parser.add_argument(
+        "--n-trials",
+        help="Number of trials for optimizing hyperparameters. "
+        "This applies to each optimization runner, not the entire optimization process.",
+        type=int,
+        default=10,
+    )
+    parser.add_argument(
+        "-optimize", "--optimize-hyperparameters", action="store_true", default=False, help="Run hyperparameters search"
+    )
+    parser.add_argument(
+        "--no-optim-plots", action="store_true", default=False, help="Disable hyperparameter optimization plots"
+    )
+    parser.add_argument("--n-jobs", help="Number of parallel jobs when optimizing hyperparameters", type=int, default=1)
+    parser.add_argument(
+        "--sampler",
+        help="Sampler to use when optimizing hyperparameters",
+        type=str,
+        default="tpe",
+        choices=["random", "tpe", "skopt"],
+    )
+    parser.add_argument(
+        "--pruner",
+        help="Pruner to use when optimizing hyperparameters",
+        type=str,
+        default="median",
+        choices=["halving", "median", "none"],
+    )
+    parser.add_argument("--n-startup-trials", help="Number of trials before using optuna sampler", type=int, default=10)
+    parser.add_argument(
+        "--n-evaluations",
+        help="Training policies are evaluated every n-timesteps // n-evaluations steps when doing hyperparameter optimization",
+        type=int,
+        default=20,
+    )
+    parser.add_argument(
+        "--storage", help="Database storage path if distributed optimization should be used", type=str, default=None
+    )
+    parser.add_argument("--study-name", help="Study name for distributed optimization", type=str, default=None)
+    parser.add_argument("--verbose", help="Verbose mode (0: no output, 1: INFO)", default=1, type=int)
+    parser.add_argument(
+        "--gym-packages",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Additional external Gym environment package modules to import (e.g. gym_minigrid)",
+    )
+    parser.add_argument(
+        "--env-kwargs", type=str, nargs="+", action=StoreDict, help="Optional keyword argument to pass to the env constructor"
+    )
+    parser.add_argument(
+        "-params",
+        "--hyperparams",
+        type=str,
+        nargs="+",
+        action=StoreDict,
+        help="Overwrite hyperparameter (e.g. learning_rate:0.01 train_freq:10)",
+    )
+    parser.add_argument("-uuid", "--uuid", action="store_true", default=False, help="Ensure that the run has a unique ID")
+    parser.add_argument(
+        "--track",
+        action="store_true",
+        default=False,
+        help="if toggled, this experiment will be tracked with Weights and Biases",
+    )
+    parser.add_argument("--wandb-project-name", type=str, default="sb3", help="the wandb's project name")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="the entity (team) of wandb's project")
     args = parser.parse_args()
-    return args
 
+    # Going through custom gym packages to let them register in the global registory
+    for env_module in args.gym_packages:
+        importlib.import_module(env_module)
 
-def evaluate(env, agent, video, num_episodes, L, step):
-    for i in range(num_episodes):
-        obs = env.reset()
-        video.init(enabled=(i == 0))
-        done = False
-        episode_reward = 0
-        while not done:
-            with utils.eval_mode(agent):
-                action = agent.select_action(obs)
-            obs, reward, done, _ = env.step(action)
-            video.record(env)
-            episode_reward += reward
+    env_id = args.env
+    registered_envs = set(gym.envs.registry.env_specs.keys())  # pytype: disable=module-attr
 
-        video.save('%d.mp4' % step)
-        L.log('eval/episode_reward', episode_reward, step)
-    L.dump(step)
+    # If the environment is not found, suggest the closest match
+    if env_id not in registered_envs:
+        try:
+            closest_match = difflib.get_close_matches(env_id, registered_envs, n=1)[0]
+        except IndexError:
+            closest_match = "'no close match found...'"
+        raise ValueError(f"{env_id} not found in gym registry, you maybe meant {closest_match}?")
 
+    # Unique id to ensure there is no race condition for the folder creation
+    uuid_str = f"_{uuid.uuid4()}" if args.uuid else ""
+    if args.seed < 0:
+        # Seed but with a random one
+        args.seed = np.random.randint(2**32 - 1, dtype="int64").item()
 
-def make_agent(obs_shape, action_shape, args, device):
-    if args.agent == 'sac_ae':
-        return SacAeAgent(
-            obs_shape=obs_shape,
-            action_shape=action_shape,
-            device=device,
-            hidden_dim=args.hidden_dim,
-            discount=args.discount,
-            init_temperature=args.init_temperature,
-            alpha_lr=args.alpha_lr,
-            alpha_beta=args.alpha_beta,
-            actor_lr=args.actor_lr,
-            actor_beta=args.actor_beta,
-            actor_log_std_min=args.actor_log_std_min,
-            actor_log_std_max=args.actor_log_std_max,
-            actor_update_freq=args.actor_update_freq,
-            critic_lr=args.critic_lr,
-            critic_beta=args.critic_beta,
-            critic_tau=args.critic_tau,
-            critic_target_update_freq=args.critic_target_update_freq,
-            encoder_type=args.encoder_type,
-            encoder_feature_dim=args.encoder_feature_dim,
-            encoder_lr=args.encoder_lr,
-            encoder_tau=args.encoder_tau,
-            num_layers=args.num_layers,
-            num_filters=args.num_filters
+    set_random_seed(args.seed)
+
+    # Setting num threads to 1 makes things run faster on cpu
+    if args.num_threads > 0:
+        if args.verbose > 1:
+            print(f"Setting torch.num_threads to {args.num_threads}")
+        th.set_num_threads(args.num_threads)
+
+    if args.trained_agent != "":
+        assert args.trained_agent.endswith(".zip") and os.path.isfile(
+            args.trained_agent
+        ), "The trained_agent must be a valid path to a .zip file"
+
+    print("=" * 10, env_id, "=" * 10)
+    print(f"Seed: {args.seed}")
+
+    if args.track:
+        try:
+            import wandb
+        except ImportError:
+            raise ImportError(
+                "if you want to use Weights & Biases to track experiment, please install W&B via `pip install wandb`"
+            )
+
+        run_name = f"{args.env}__{args.algo}__{args.seed}__{int(time.time())}"
+        run = wandb.init(
+            name=run_name,
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            config=vars(args),
+            sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
+            monitor_gym=True,  # auto-upload the videos of agents playing the game
+            save_code=True,  # optional
         )
+        args.tensorboard_log = f"runs/{run_name}"
+
+    exp_manager = ExperimentManager(
+        args,
+        args.algo,
+        env_id,
+        args.log_folder,
+        args.tensorboard_log,
+        args.n_timesteps,
+        args.eval_freq,
+        args.eval_episodes,
+        args.save_freq,
+        args.hyperparams,
+        args.env_kwargs,
+        args.trained_agent,
+        args.optimize_hyperparameters,
+        args.storage,
+        args.study_name,
+        args.n_trials,
+        args.n_jobs,
+        args.sampler,
+        args.pruner,
+        args.optimization_log_path,
+        n_startup_trials=args.n_startup_trials,
+        n_evaluations=args.n_evaluations,
+        truncate_last_trajectory=args.truncate_last_trajectory,
+        uuid_str=uuid_str,
+        seed=args.seed,
+        log_interval=args.log_interval,
+        save_replay_buffer=args.save_replay_buffer,
+        verbose=args.verbose,
+        vec_env_type=args.vec_env,
+        n_eval_envs=args.n_eval_envs,
+        no_optim_plots=args.no_optim_plots,
+    )
+
+    # Prepare experiment and launch hyperparameter optimization if needed
+    results = exp_manager.setup_experiment()
+    if results is not None:
+        model, saved_hyperparams = results
+        if args.track:
+            # we need to save the loaded hyperparameters
+            args.saved_hyperparams = saved_hyperparams
+            run.config.setdefaults(vars(args))
+
+        # Normal training
+        if model is not None:
+            exp_manager.learn(model)
+            exp_manager.save_trained_model(model)
     else:
-        assert 'agent is not supported: %s' % args.agent
-
-
-def main():
-    args = parse_args()
-    utils.set_seed_everywhere(args.seed)
-
-    env_kwargs = get_env_kwargs(args)
-    env = make_env(args.env, 0, args.log_path, done_when_success=True, flatten_dict=True, kwargs=env_kwargs)
-    env.seed(args.seed)
-
-    # stack several consecutive frames together
-    if args.encoder_type == 'pixel':
-        env = utils.FrameStack(env, k=args.frame_stack)
-
-    utils.make_dir(args.work_dir)
-    video_dir = utils.make_dir(os.path.join(args.work_dir, 'video'))
-    model_dir = utils.make_dir(os.path.join(args.work_dir, 'model'))
-    buffer_dir = utils.make_dir(os.path.join(args.work_dir, 'buffer'))
-
-    video = VideoRecorder(video_dir if args.save_video else None)
-
-    with open(os.path.join(args.work_dir, 'args.json'), 'w') as f:
-        json.dump(vars(args), f, sort_keys=True, indent=4)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # the dmc2gym wrapper standardizes actions
-    assert env.action_space.low.min() >= -1
-    assert env.action_space.high.max() <= 1
-
-    replay_buffer = utils.ReplayBuffer(
-        obs_shape=env.observation_space.shape,
-        action_shape=env.action_space.shape,
-        capacity=args.replay_buffer_capacity,
-        batch_size=args.batch_size,
-        device=device
-    )
-
-    agent = make_agent(
-        obs_shape=env.observation_space.shape,
-        action_shape=env.action_space.shape,
-        args=args,
-        device=device
-    )
-
-    L = Logger(args.work_dir, use_tb=args.save_tb)
-
-    episode, episode_reward, done = 0, 0, True
-    start_time = time.time()
-    for step in range(args.num_train_steps):
-        if done:
-            if step > 0:
-                L.log('train/duration', time.time() - start_time, step)
-                start_time = time.time()
-                L.dump(step)
-
-            # evaluate agent periodically
-            if step % args.eval_freq == 0:
-                L.log('eval/episode', episode, step)
-                evaluate(env, agent, video, args.num_eval_episodes, L, step)
-                if args.save_model:
-                    agent.save(model_dir, step)
-                if args.save_buffer:
-                    replay_buffer.save(buffer_dir)
-
-            L.log('train/episode_reward', episode_reward, step)
-
-            obs = env.reset()
-            done = False
-            episode_reward = 0
-            episode_step = 0
-            episode += 1
-
-            L.log('train/episode', episode, step)
-
-        # sample action for data collection
-        if step < args.init_steps:
-            action = env.action_space.sample()
-        else:
-            with utils.eval_mode(agent):
-                action = agent.sample_action(obs)
-
-        # run training update
-        if step >= args.init_steps:
-            num_updates = args.init_steps if step == args.init_steps else 1
-            for _ in range(num_updates):
-                agent.update(replay_buffer, L, step)
-
-        next_obs, reward, done, _ = env.step(action)
-
-        # allow infinit bootstrap
-        done_bool = 0 if episode_step + 1 == env.max_episode_steps else float(
-            done
-        )
-        episode_reward += reward
-
-        replay_buffer.add(obs, action, reward, next_obs, done_bool)
-
-        obs = next_obs
-        episode_step += 1
-
-
-if __name__ == '__main__':
-    main()
+        exp_manager.hyperparameters_optimization()

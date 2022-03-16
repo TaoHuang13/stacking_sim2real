@@ -415,21 +415,24 @@ class ArmPickAndPlace(ArmGoalEnv):
         """
         action = np.zeros(4)
         for i, waypoint in enumerate(self._waypoints):
-            print(i)
             if waypoint is None:
                 continue
             delta_pos = (waypoint[:3] - obs['observation'][:3]) / 0.1
             delta_yaw = (waypoint[3] - obs['observation'][3]) / 0.1
-            print(np.linalg.norm(delta_pos))
             action = np.array([delta_pos[0], delta_pos[1], delta_pos[2], delta_yaw])
             if np.linalg.norm(delta_pos) < 1e-1:
                 self._waypoints[i] = None
             break
         
-        print(action)
         #action = np.zeros(4)
         return action
 
+    def get_dynamics_info(self):
+    
+        print(self.p.getDynamicsInfo(self.robot.id, 9))
+
+    def change_dynamics_info(self):
+        self.p.changeDynamics(self.blocks_id[0], -1, mass=0.2)
 
 class ArmStack(ArmPickAndPlace):
     def __init__(self, *args, n_to_stack=[1], **kwargs):

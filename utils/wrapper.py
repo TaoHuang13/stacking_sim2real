@@ -109,7 +109,6 @@ class FlexibleTimeLimitWrapper(gym.Wrapper):
         assert 'BulletStack' in env.spec.id
         assert env.spec.max_episode_steps is None
         self._elapsed_steps = None
-        self.max_episode_steps = self.env.unwrapped.n_to_stack * 50 if self.env.unwrapped.n_to_stack > 2 else 100
 
     def step(self, action):
         assert self._elapsed_steps is not None, "Cannot call env.step() before calling reset()"

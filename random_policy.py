@@ -6,7 +6,7 @@ import os
 def main():
     args = arg_parse()
     env_kwargs = get_env_kwargs(args)
-    env = make_env(args.env, 0, args.log_path, done_when_success=True, flatten_dict=True, kwargs=env_kwargs)
+    env = make_env(args.env, 0, args.log_path, done_when_success=True, flatten_dict=False, kwargs=env_kwargs)
     obs = env.reset()
     done = False
 
@@ -14,7 +14,10 @@ def main():
     folder = os.path.dirname(os.path.abspath(__file__))
     writer = imageio.get_writer(os.path.join(folder, video_name), fps=10)
     while not done:
-        action = env.action_space.sample()
+        #action = env.action_space.sample()
+        action = env.get_oracle_action(obs)
+        print(env.get_dynamics_info())
+        env.change_dynamics_info()
         obs, reward, done, info = env.step(action)
         img = env.render(mode="rgb_array")
         writer.append_data(img)
