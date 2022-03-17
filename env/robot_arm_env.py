@@ -437,6 +437,7 @@ class ArmPickAndPlace(ArmGoalEnv):
     def change_dynamics_info(self):
         self.p.changeDynamics(self.blocks_id[0], -1, mass=0.2)
 
+
 class ArmStack(ArmPickAndPlace):
     def __init__(self, *args, n_to_stack=[1], **kwargs):
         self.n_to_stack_choices = n_to_stack
@@ -519,19 +520,27 @@ class ArmStack(ArmPickAndPlace):
             object_rel_pos = object_pos - eef_pos
             obs = np.concatenate([obs, object_pos, object_rel_pos, object_euler, object_velp, object_velr])
             if self.n_object > 1:
-                goal_indicator = (np.argmax(self.goal[3:]) == i)
+                goal_indicator = (np.argmax(self.goal[3*self.n_to_stack:]) == i)    # num of subgoals and goal: self.n_to_stack
                 obs = np.concatenate([obs, [goal_indicator]])
             if self.object_dim is None:
                 self.object_dim = len(obs) - self.robot_dim
         for i in range(self.n_active_object, self.n_object):
             obs = np.concatenate([obs, -np.ones(self.object_dim)])
-        achieved_goal = np.concatenate([self._get_achieved_goal(), self.goal[3:]])
+        achieved_goal = np.concatenate([self._get_achieved_goal(), self.goal[3*self.n_to_stack:]])
         obs_dict = dict(observation=obs, achieved_goal=achieved_goal, desired_goal=self.goal.copy())
         return obs_dict
 
     def _get_achieved_goal(self):
-        goal_idx = 0 if self.n_object == 1 else np.argmax(self.goal[3*self.n_to_stack:])
-        cur_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx])
+        if self.n_active_object == 1:
+            goal_idx = 0
+            cur_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx])
+        else:
+            goal_idx = np.where(self.goal[3*self.n_to_stack:] >= 1)[0]
+            cur_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx[0]])
+            cur_pos = list(cur_pos)
+            for i in range(1, self.n_to_stack):
+                cur_pos_, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx[1]])
+                cur_pos.extend(list(cur_pos_))
         return np.array(cur_pos)
 
     def _sample_goal(self):
@@ -644,7 +653,7 @@ class ArmStack(ArmPickAndPlace):
         return dict(n_base=n_base, n_to_stack=n_to_stack, n_active=n_active)
 
     def compute_reward_and_info(self):
-        goal_pos = self.goal[:3]
+        goal_pos = self.goal[:3*self.n_to_stack]
         cur_pos = self._get_achieved_goal()
         goal_distance = np.linalg.norm(goal_pos - cur_pos)
         eef_distance = np.linalg.norm(self.robot.get_eef_position() - goal_pos)
