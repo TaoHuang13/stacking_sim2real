@@ -446,6 +446,7 @@ class ArmStack(ArmPickAndPlace):
         self.n_base = 0
         self.base_xy = np.array([0, 0])
         self.cl_ratio = 0
+        self.distance_threshold = 0.05
         super(ArmStack, self).__init__(*args, **kwargs)
 
     def _reset_sim(self):
@@ -652,14 +653,33 @@ class ArmStack(ArmPickAndPlace):
         n_active = int(np.sum(np.linalg.norm(objects_pos[:, :2] + 1, axis=-1) > 1e-2))
         return dict(n_base=n_base, n_to_stack=n_to_stack, n_active=n_active)
 
+    def gripper_pos_far_from_goals(self, goal, gripper_pos):
+        distances = [
+            np.linalg.norm(gripper_pos - goal[i*3:(i+1)*3], axis=-1) for i in range(self.n_to_stack)
+        ]
+        return np.all([d > self.distance_threshold * 2 for d in distances], axis=0)
+
+    def subgoal_distances(self, goal_a, goal_b):
+        assert goal_a.shape == goal_b.shape
+        for i in range(self.n_to_stack - 1):
+            assert goal_a[..., i * 3:(i + 1) * 3].shape == goal_a[..., (i + 1) * 3:(i + 2) * 3].shape
+        return [
+            np.linalg.norm(goal_a[..., i * 3:(i + 1) * 3] - goal_b[..., i * 3:(i + 1) * 3], axis=-1) for i in
+            range(self.n_to_stack)
+        ]
+
     def compute_reward_and_info(self):
         goal_pos = self.goal[:3*self.n_to_stack]
         cur_pos = self._get_achieved_goal()
-        goal_distance = np.linalg.norm(goal_pos - cur_pos)
-        eef_distance = np.linalg.norm(self.robot.get_eef_position() - goal_pos)
+        gripper_pos = self.robot.get_eef_position()
+
+        subgoal_distances = self.subgoal_distances(cur_pos, goal_pos)
+        goal_distance = np.linalg.norm(goal_pos[3*(self.n_to_stack-1):3*self.n_to_stack] - cur_pos[3*(self.n_to_stack-1):3*self.n_to_stack])    # only the top of tower
+        eef_distance = np.linalg.norm(gripper_pos - goal_pos[3*(self.n_to_stack-1):3*self.n_to_stack])
+
         is_stable = False
         eef_threshold = 0.1 * (1 - self.cl_ratio) if self.n_to_stack == 1 else 0.1
-        if goal_distance < 0.03 and eef_distance > eef_threshold:
+        if goal_distance < self.distance_threshold and eef_distance > eef_threshold:
             # debug_obs1 = self._get_obs()
             state_id = self.p.saveState()
             for _ in range(50):
@@ -676,9 +696,17 @@ class ArmStack(ArmPickAndPlace):
         if self.reward_type == "sparse":
             reward = float(is_stable)
         elif self.reward_type == "dense":
-            # TODO
-            reward = self._previous_distance - (goal_distance - (goal_distance < 0.05) * eef_distance) + is_stable
-            self._previous_distance = goal_distance - (goal_distance < 0.05) * eef_distance
+            # TODO(HT): refer to and check with 
+            # https://github.com/richardrl/fetch-block-construction/blob/master/fetch_block_construction/envs/robotics/fetch/construction.py
+            stacked_reward = -np.sum([(d > self.distance_threshold).astype(np.float32) for d in subgoal_distances], axis=0)
+            stacked_reward = np.asarray(stacked_reward)
+            reward = stacked_reward.copy()
+            np.putmask(reward, reward == 0, self.gripper_pos_far_from_goals(goal_pos, gripper_pos))
+
+            if stacked_reward != 0:
+                next_block_id = int(self.n_to_stack - np.abs(stacked_reward))
+                assert 0 <= next_block_id < self.n_to_stack
+                reward -= .01 * np.linalg.norm(gripper_pos - goal_pos[next_block_id*3: (next_block_id+1)*3])
         else:
             raise NotImplementedError
         is_success = is_stable
