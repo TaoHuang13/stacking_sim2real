@@ -109,10 +109,41 @@ class FlexibleTimeLimitWrapper(gym.Wrapper):
         assert 'BulletStack' in env.spec.id
         assert env.spec.max_episode_steps is None
         self._elapsed_steps = None
+        self.max_episode_steps = self.env.unwrapped.n_to_stack * 50 if self.env.unwrapped.n_to_stack > 2 else 100
+
 
     def step(self, action):
         assert self._elapsed_steps is not None, "Cannot call env.step() before calling reset()"
         time_limit = self.env.unwrapped.n_to_stack * 50 if self.env.unwrapped.n_to_stack > 2 else 100
+        observation, reward, done, info = self.env.step(action)
+        self._elapsed_steps += 1
+        if self._elapsed_steps >= time_limit:
+            info['TimeLimit.truncated'] = not done
+            done = True
+        return observation, reward, done, info
+
+    def reset(self, **kwargs):
+        self._elapsed_steps = 0
+        return self.env.reset(**kwargs)
+
+class TimeLimitWrapper(gym.Wrapper):
+    '''
+    ONLY applicable to Stacking environment!
+    We can set max_episode_steps = None for gym, (so gym.TimeLimitWrapper is not applied),
+    then use this class to avoid potential conflict.
+    '''
+    def __init__(self, env):
+        super(TimeLimitWrapper, self).__init__(env)
+        # self.time_limit = time_limit
+        assert 'BulletPickAndPlace' in env.spec.id
+        assert env.spec.max_episode_steps is None
+        self._elapsed_steps = None
+        self.max_episode_steps = 50
+
+
+    def step(self, action):
+        assert self._elapsed_steps is not None, "Cannot call env.step() before calling reset()"
+        time_limit = 50
         observation, reward, done, info = self.env.step(action)
         self._elapsed_steps += 1
         if self._elapsed_steps >= time_limit:

@@ -1,11 +1,11 @@
 import argparse
 import os
 
-from env.robot_arm_env import ArmStack
+from env.robot_arm_env import ArmStack, ArmPickAndPlace
 # from fetch_stack import FetchStackEnv
 
 import gym
-from gym.wrappers import FlattenDictWrapper
+from gym.wrappers import FlattenObservation
 from utils.monitor import Monitor
 from utils.wrapper import DoneOnSuccessWrapper, SwitchGoalWrapper
 import subprocess
@@ -13,6 +13,7 @@ import subprocess
 
 PICK_ENTRY_POINT = {
     'BulletStack-v1': ArmStack,
+    'BulletPickAndPlace-v0': ArmPickAndPlace
 }
 
 
@@ -39,8 +40,11 @@ def make_env(env_id, rank, log_dir=None, done_when_success=False, allow_switch_g
     if "BulletStack" in env_id:
         from utils.wrapper import FlexibleTimeLimitWrapper
         env = FlexibleTimeLimitWrapper(env)
+    if "BulletPickAndPlace" in env_id:
+        from utils.wrapper import TimeLimitWrapper
+        env = TimeLimitWrapper(env)
     if flatten_dict:
-        env = FlattenDictWrapper(env, ['observation', 'achieved_goal', 'desired_goal'])
+        env = FlattenObservation(env)
     if done_when_success:
         reward_offset = 0
         env = DoneOnSuccessWrapper(env, reward_offset)
@@ -61,6 +65,13 @@ def get_env_kwargs(args):
             n_to_stack=args.n_to_stack,
             action_dim=4 if not args.allow_rotation else 5,
         )
+    elif args.env == "BulletPickAndPlace-v0":
+        return dict(
+            robot=args.robot,
+            reward_type=args.reward_type,
+            n_object=args.n_object,
+            action_dim=4 if not args.allow_rotation else 5,
+        )
     else:
         raise NotImplementedError
 
@@ -72,7 +83,7 @@ def arg_parse():
     parser.add_argument('--allow_rotation', action="store_true", default=False,
                         help="Whether to enable rotation around z axis in action space.")
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--reward_type', type=str, default='sparse')
+    parser.add_argument('--reward_type', type=str, default='dense')
     parser.add_argument('--n_object', type=int, default=2)
     parser.add_argument('--n_to_stack', type=int, nargs='+', default=1)
     parser.add_argument('--log_path', default=None, type=str)
