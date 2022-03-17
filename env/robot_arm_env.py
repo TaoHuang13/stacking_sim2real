@@ -114,6 +114,9 @@ class ArmGoalEnv(gym.Env):
 
     def visualize_goal(self, goal):
         goal_idx = np.argmax(goal[3:])
+        print(self.n_base)
+        print(self.n_to_stack)
+        print(goal_idx)
         if self.body_goal is None:
             vis_id = self.p.createVisualShape(self.p.GEOM_SPHERE, radius=0.025, rgbaColor=COLOR[goal_idx % len(COLOR)] + [0.2])
             self.body_goal = self.p.createMultiBody(0, baseVisualShapeIndex=vis_id, basePosition=goal[:3])
@@ -136,7 +139,7 @@ class ArmGoalEnv(gym.Env):
 
 
 class ArmPickAndPlace(ArmGoalEnv):
-    def __init__(self, robot="xarm", seed=None, n_object=1, reward_type="sparse", action_dim=4):
+    def __init__(self, robot="xarm", seed=None, n_object=1, reward_type="dense", action_dim=4):
         self.n_object = n_object
         self.n_active_object = n_object
         self.blocks_id = []
@@ -147,7 +150,7 @@ class ArmPickAndPlace(ArmGoalEnv):
         self._previous_distance = None
         self.inactive_xy = (10, 10)
         super(ArmPickAndPlace, self).__init__(robot, seed, action_dim)
-    
+
     def _setup_callback(self):
         for i in range(self.n_object):
             self.blocks_id.append(
@@ -500,12 +503,54 @@ class ArmStack(ArmPickAndPlace):
         #     for n in range(self.n_object):
         #         print(self.p.getBasePositionAndOrientation(self.blocks_id[n]))
 
+    def _get_obs(self):
+        obs = self.robot.get_obs()
+        eef_pos = obs[:3]
+        if self.robot_dim is None:
+            self.robot_dim = len(obs)
+        for i in range(self.n_active_object):
+            object_pos, object_quat = self.p.getBasePositionAndOrientation(self.blocks_id[i])
+            object_quat = convert_symmetric_rotation(np.array(object_quat))
+            object_euler = self.p.getEulerFromQuaternion(object_quat)
+            object_velp, object_velr = self.p.getBaseVelocity(self.blocks_id[i])
+            object_pos, object_euler, object_velp, object_velr = map(np.array, [object_pos, object_euler, object_velp, object_velr])
+            object_velp *= self.dt * self.robot.num_substeps
+            object_velr *= self.dt * self.robot.num_substeps
+            object_rel_pos = object_pos - eef_pos
+            obs = np.concatenate([obs, object_pos, object_rel_pos, object_euler, object_velp, object_velr])
+            if self.n_object > 1:
+                goal_indicator = (np.argmax(self.goal[3:]) == i)
+                obs = np.concatenate([obs, [goal_indicator]])
+            if self.object_dim is None:
+                self.object_dim = len(obs) - self.robot_dim
+        for i in range(self.n_active_object, self.n_object):
+            obs = np.concatenate([obs, -np.ones(self.object_dim)])
+        achieved_goal = np.concatenate([self._get_achieved_goal(), self.goal[3:]])
+        obs_dict = dict(observation=obs, achieved_goal=achieved_goal, desired_goal=self.goal.copy())
+        return obs_dict
+
+    def _get_achieved_goal(self):
+        goal_idx = 0 if self.n_object == 1 else np.argmax(self.goal[3*self.n_to_stack:])
+        cur_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx])
+        return np.array(cur_pos)
+
     def _sample_goal(self):
-        goal = np.array([self.base_xy[0], self.base_xy[1],
-                         self.robot.base_pos[2] + 0.025 + (self.n_base + self.n_to_stack - 1) * 0.05])
+        # goal = np.array([self.base_xy[0], self.base_xy[1],
+        #                  self.robot.base_pos[2] + 0.025 + (self.n_base + self.n_to_stack - 1) * 0.05])
+        # goal = np.array([self.base_xy[0], self.base_xy[1],
+        #                   self.robot.base_pos[2] + 0.025 + (self.n_base + i) * 0.05 for i in range(self.n_to_stack)])
+        goal = [self.base_xy[0], self.base_xy[1],
+                          self.robot.base_pos[2] + 0.025 + (self.n_base + 0) * 0.05]
+        for i in range(1, self.n_to_stack):
+            goal.extend([self.base_xy[0], self.base_xy[1],
+                            self.robot.base_pos[2] + 0.025 + (self.n_base + i) * 0.05])
+
         goal_onehot = np.zeros(self.n_object)
-        goal_idx = self.np_random.randint(self.n_base, self.n_active_object)
-        goal_onehot[goal_idx] = 1
+        #goal_idx = self.np_random.randint(self.n_base, self.n_active_object)
+        goal_idxs = self.np_random.choice(range(self.n_base, self.n_active_object), self.n_to_stack, replace=False) 
+        goal_onehot[goal_idxs[:-1]] = 1
+
+        goal_onehot[goal_idxs[-1]] = 2
         goal = np.concatenate([goal, goal_onehot])
         if self.reward_type == "sparse" and self.n_to_stack == 1 and \
                 self.n_base > 0 and self.np_random.uniform() < 0.5:
@@ -515,8 +560,9 @@ class ArmStack(ArmPickAndPlace):
                 relative=True, teleport=True
             )
             self.p.resetBasePositionAndOrientation(
-                self.blocks_id[goal_idx], self.robot.get_eef_position(), (0, 0, 0, 1))
+                self.blocks_id[goal_idxs[0]], self.robot.get_eef_position(), (0, 0, 0, 1))
         if self.n_to_stack > 2 and self.np_random.uniform() < 0.5:
+            goal_idx = goal_idxs[-1]
             # generate block position very close to base position
             all_block_positions = [np.array(self.p.getBasePositionAndOrientation(i)[0]) for i in self.blocks_id]
             all_block_positions[goal_idx][0] = self.base_xy[0] + self.np_random.uniform(0.05, 0.1) * self.np_random.choice([1, -1])
@@ -533,8 +579,19 @@ class ArmStack(ArmPickAndPlace):
             self.p.resetBasePositionAndOrientation(
                 self.blocks_id[goal_idx], all_block_positions[goal_idx], (0, 0, 0, 1)
             )
-        self.visualize_goal(goal)
+        self.visualize_goals(goal)
         return goal
+
+    def visualize_goals(self, goal):
+        #goal_idx = np.argmax(goal[3:])
+        goal_idxes = np.where(goal[3*self.n_to_stack:] >= 1)[0]
+        for i, goal_idx in enumerate(goal_idxes):
+            # if self.body_goal is None:
+            vis_id = self.p.createVisualShape(self.p.GEOM_SPHERE, radius=0.025, rgbaColor=COLOR[goal_idx % len(COLOR)] + [0.2])
+            self.body_goal = self.p.createMultiBody(0, baseVisualShapeIndex=vis_id, basePosition=goal[3*i:3*(i+1)])
+            # else:
+            #     self.p.resetBasePositionAndOrientation(self.body_goal, goal[3*(i-1):3*i], (0, 0, 0, 1))
+            #     self.p.changeVisualShape(self.body_goal, -1, rgbaColor=COLOR[goal_idx[0] % len(COLOR)] + [0.2])
 
     def set_choice_prob(self, n_to_stack, prob):
         probs = self.n_to_stack_probs
@@ -626,7 +683,6 @@ class ArmStack(ArmPickAndPlace):
     def set_cl_ratio(self, cl_ratio):
         self.cl_ratio = cl_ratio
 
-
 def _create_block(physics_client, halfExtents, pos, orn, mass=0.2, rgba=None, vel=None, vela=None):
     col_id = physics_client.createCollisionShape(physics_client.GEOM_BOX, halfExtents=halfExtents)
     vis_id = physics_client.createVisualShape(physics_client.GEOM_BOX, halfExtents=halfExtents)
@@ -714,7 +770,6 @@ def convert_symmetric_rotation(q):
     # mat_q = quat2mat(q)
     symmetrics_quat = np.array([quat_mul(static_quat[i], q) for i in range(mat.shape[0])])
     return symmetrics_quat[np.argmax(symmetrics_quat[:, -1])]
-
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
