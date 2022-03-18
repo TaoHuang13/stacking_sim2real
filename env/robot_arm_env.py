@@ -114,9 +114,6 @@ class ArmGoalEnv(gym.Env):
 
     def visualize_goal(self, goal):
         goal_idx = np.argmax(goal[3:])
-        print(self.n_base)
-        print(self.n_to_stack)
-        print(goal_idx)
         if self.body_goal is None:
             vis_id = self.p.createVisualShape(self.p.GEOM_SPHERE, radius=0.025, rgbaColor=COLOR[goal_idx % len(COLOR)] + [0.2])
             self.body_goal = self.p.createMultiBody(0, baseVisualShapeIndex=vis_id, basePosition=goal[:3])
@@ -163,6 +160,7 @@ class ArmPickAndPlace(ArmGoalEnv):
         obs_dict = super().reset()
         if self.reward_type == "dense":
             self._previous_distance = np.linalg.norm(obs_dict["achieved_goal"][:3] - obs_dict["desired_goal"][:3])
+            self._previous_distance += np.linalg.norm(self.robot.get_eef_position() - obs_dict["achieved_goal"][:3])
         return obs_dict
 
     def _sample_goal(self):
@@ -275,9 +273,18 @@ class ArmPickAndPlace(ArmGoalEnv):
         distance = np.linalg.norm(goal_pos - cur_pos)
         if self.reward_type == "sparse":
             reward = (distance < 0.05)
+        # elif self.reward_type == "dense":
+        #     reward = self._previous_distance - distance
+        #     self._previous_distance = distance
         elif self.reward_type == "dense":
-            reward = self._previous_distance - distance
-            self._previous_distance = distance
+            # TODO: refer to https://github.com/rlworkgroup/metaworld/blob/master/metaworld/envs/mujoco/sawyer_xyz/v1/sawyer_bin_picking.py 
+            gripper_pos = self.robot.get_eef_position()
+            reachDist = np.linalg.norm(cur_pos - gripper_pos)
+
+            distance_ = distance + reachDist
+            reward = self._previous_distance - distance_
+            self._previous_distance = distance_
+
         else:
             raise NotImplementedError
         is_success = (distance < 0.05)
