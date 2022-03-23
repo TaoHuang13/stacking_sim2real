@@ -16,7 +16,14 @@ import utils.import_envs  # noqa: F401 pytype: disable=import-error
 from utils.exp_manager import ExperimentManager
 from utils.utils import ALGOS, StoreDict
 
+from env.robot_arm_env import ArmStack, ArmPickAndPlace
+
 seaborn.set()
+
+PICK_ENTRY_POINT = {
+    'BulletStack-v1': ArmStack,
+    'BulletPickAndPlace-v0': ArmPickAndPlace
+}
 
 if __name__ == "__main__":  # noqa: C901
     parser = argparse.ArgumentParser()
@@ -123,6 +130,14 @@ if __name__ == "__main__":  # noqa: C901
     )
     parser.add_argument("--wandb-project-name", type=str, default="sb3", help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None, help="the entity (team) of wandb's project")
+    
+    # stacking
+    parser.add_argument('--robot', choices=['panda'], default='panda')
+    parser.add_argument('--allow_rotation', action="store_true", default=False,
+                        help="Whether to enable rotation around z axis in action space.")
+    parser.add_argument('--reward_type', type=str, default='dense')
+    parser.add_argument('--n_object', type=int, default=2)
+    parser.add_argument('--n_to_stack', type=int, nargs='+', default=1)
     args = parser.parse_args()
 
     # Going through custom gym packages to let them register in the global registory
@@ -134,11 +149,19 @@ if __name__ == "__main__":  # noqa: C901
 
     # If the environment is not found, suggest the closest match
     if env_id not in registered_envs:
-        try:
-            closest_match = difflib.get_close_matches(env_id, registered_envs, n=1)[0]
-        except IndexError:
-            closest_match = "'no close match found...'"
-        raise ValueError(f"{env_id} not found in gym registry, you maybe meant {closest_match}?")
+        # try:
+        #     closest_match = difflib.get_close_matches(env_id, registered_envs, n=1)[0]
+        # except IndexError:
+        #     closest_match = "'no close match found...'"
+        # raise ValueError(f"{env_id} not found in gym registry, you maybe meant {closest_match}?")
+        kwargs= dict(
+            robot=args.robot,
+            reward_type=args.reward_type,
+            n_object=args.n_object,
+            n_to_stack=args.n_to_stack,
+            action_dim=4 if not args.allow_rotation else 5,
+        )
+        gym.register(env_id, entry_point=PICK_ENTRY_POINT[env_id], max_episode_steps=None, kwargs=kwargs)
 
     # Unique id to ensure there is no race condition for the folder creation
     uuid_str = f"_{uuid.uuid4()}" if args.uuid else ""

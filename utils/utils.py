@@ -1,170 +1,359 @@
-import torch
-import numpy as np
-import torch.nn as nn
-import gym
+import argparse
+import glob
+import importlib
 import os
-from collections import deque
-import random
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import gym
+import stable_baselines3 as sb3  # noqa: F401
+import torch as th  # noqa: F401
+import yaml
+from sb3_contrib import ARS, QRDQN, TQC, TRPO
+from stable_baselines3 import A2C, DDPG, DQN, PPO, SAC, TD3
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.sb2_compat.rmsprop_tf_like import RMSpropTFLike  # noqa: F401
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv, VecFrameStack, VecNormalize
+
+# For custom activation fn
+from torch import nn as nn  # noqa: F401 pylint: disable=unused-import
+
+ALGOS = {
+    "a2c": A2C,
+    "ddpg": DDPG,
+    "dqn": DQN,
+    "ppo": PPO,
+    "sac": SAC,
+    "td3": TD3,
+    # SB3 Contrib,
+    "ars": ARS,
+    "qrdqn": QRDQN,
+    "tqc": TQC,
+    "trpo": TRPO,
+}
 
 
-class eval_mode(object):
-    def __init__(self, *models):
-        self.models = models
-
-    def __enter__(self):
-        self.prev_states = []
-        for model in self.models:
-            self.prev_states.append(model.training)
-            model.train(False)
-
-    def __exit__(self, *args):
-        for model, state in zip(self.models, self.prev_states):
-            model.train(state)
-        return False
-
-
-def soft_update_params(net, target_net, tau):
-    for param, target_param in zip(net.parameters(), target_net.parameters()):
-        target_param.data.copy_(
-            tau * param.data + (1 - tau) * target_param.data
-        )
-
-
-def set_seed_everywhere(seed):
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
-
-def module_hash(module):
-    result = 0
-    for tensor in module.state_dict().values():
-        result += tensor.sum().item()
-    return result
-
-
-def make_dir(dir_path):
+def flatten_dict_observations(env: gym.Env) -> gym.Env:
+    assert isinstance(env.observation_space, gym.spaces.Dict)
     try:
-        os.mkdir(dir_path)
-    except OSError:
-        pass
-    return dir_path
+        return gym.wrappers.FlattenObservation(env)
+    except AttributeError:
+        keys = env.observation_space.spaces.keys()
+        return gym.wrappers.FlattenDictWrapper(env, dict_keys=list(keys))
 
 
-def preprocess_obs(obs, bits=5):
-    """Preprocessing image, see https://arxiv.org/abs/1807.03039."""
-    bins = 2**bits
-    assert obs.dtype == torch.float32
-    if bits < 8:
-        obs = torch.floor(obs / 2**(8 - bits))
-    obs = obs / bins
-    obs = obs + torch.rand_like(obs) / bins
-    obs = obs - 0.5
-    return obs
+def get_wrapper_class(hyperparams: Dict[str, Any]) -> Optional[Callable[[gym.Env], gym.Env]]:
+    """
+    Get one or more Gym environment wrapper class specified as a hyper parameter
+    "env_wrapper".
+    e.g.
+    env_wrapper: gym_minigrid.wrappers.FlatObsWrapper
+
+    for multiple, specify a list:
+
+    env_wrapper:
+        - utils.wrappers.PlotActionWrapper
+        - utils.wrappers.TimeFeatureWrapper
 
 
-class ReplayBuffer(object):
-    """Buffer to store environment transitions."""
-    def __init__(self, obs_shape, action_shape, capacity, batch_size, device):
-        self.capacity = capacity
-        self.batch_size = batch_size
-        self.device = device
+    :param hyperparams:
+    :return: maybe a callable to wrap the environment
+        with one or multiple gym.Wrapper
+    """
 
-        # the proprioceptive obs is stored as float32, pixels obs as uint8
-        obs_dtype = np.float32 if len(obs_shape) == 1 else np.uint8
+    def get_module_name(wrapper_name):
+        return ".".join(wrapper_name.split(".")[:-1])
 
-        self.obses = np.empty((capacity, *obs_shape), dtype=obs_dtype)
-        self.next_obses = np.empty((capacity, *obs_shape), dtype=obs_dtype)
-        self.actions = np.empty((capacity, *action_shape), dtype=np.float32)
-        self.rewards = np.empty((capacity, 1), dtype=np.float32)
-        self.not_dones = np.empty((capacity, 1), dtype=np.float32)
+    def get_class_name(wrapper_name):
+        return wrapper_name.split(".")[-1]
 
-        self.idx = 0
-        self.last_save = 0
-        self.full = False
+    if "env_wrapper" in hyperparams.keys():
+        wrapper_name = hyperparams.get("env_wrapper")
 
-    def add(self, obs, action, reward, next_obs, done):
-        np.copyto(self.obses[self.idx], obs)
-        np.copyto(self.actions[self.idx], action)
-        np.copyto(self.rewards[self.idx], reward)
-        np.copyto(self.next_obses[self.idx], next_obs)
-        np.copyto(self.not_dones[self.idx], not done)
+        if wrapper_name is None:
+            return None
 
-        self.idx = (self.idx + 1) % self.capacity
-        self.full = self.full or self.idx == 0
+        if not isinstance(wrapper_name, list):
+            wrapper_names = [wrapper_name]
+        else:
+            wrapper_names = wrapper_name
 
-    def sample(self):
-        idxs = np.random.randint(
-            0, self.capacity if self.full else self.idx, size=self.batch_size
-        )
+        wrapper_classes = []
+        wrapper_kwargs = []
+        # Handle multiple wrappers
+        for wrapper_name in wrapper_names:
+            # Handle keyword arguments
+            if isinstance(wrapper_name, dict):
+                assert len(wrapper_name) == 1, (
+                    "You have an error in the formatting "
+                    f"of your YAML file near {wrapper_name}. "
+                    "You should check the indentation."
+                )
+                wrapper_dict = wrapper_name
+                wrapper_name = list(wrapper_dict.keys())[0]
+                kwargs = wrapper_dict[wrapper_name]
+            else:
+                kwargs = {}
+            wrapper_module = importlib.import_module(get_module_name(wrapper_name))
+            wrapper_class = getattr(wrapper_module, get_class_name(wrapper_name))
+            wrapper_classes.append(wrapper_class)
+            wrapper_kwargs.append(kwargs)
 
-        obses = torch.as_tensor(self.obses[idxs], device=self.device).float()
-        actions = torch.as_tensor(self.actions[idxs], device=self.device)
-        rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
-        next_obses = torch.as_tensor(
-            self.next_obses[idxs], device=self.device
-        ).float()
-        not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
+        def wrap_env(env: gym.Env) -> gym.Env:
+            """
+            :param env:
+            :return:
+            """
+            for wrapper_class, kwargs in zip(wrapper_classes, wrapper_kwargs):
+                env = wrapper_class(env, **kwargs)
+            return env
 
-        return obses, actions, rewards, next_obses, not_dones
-
-    def save(self, save_dir):
-        if self.idx == self.last_save:
-            return
-        path = os.path.join(save_dir, '%d_%d.pt' % (self.last_save, self.idx))
-        payload = [
-            self.obses[self.last_save:self.idx],
-            self.next_obses[self.last_save:self.idx],
-            self.actions[self.last_save:self.idx],
-            self.rewards[self.last_save:self.idx],
-            self.not_dones[self.last_save:self.idx]
-        ]
-        self.last_save = self.idx
-        torch.save(payload, path)
-
-    def load(self, save_dir):
-        chunks = os.listdir(save_dir)
-        chucks = sorted(chunks, key=lambda x: int(x.split('_')[0]))
-        for chunk in chucks:
-            start, end = [int(x) for x in chunk.split('.')[0].split('_')]
-            path = os.path.join(save_dir, chunk)
-            payload = torch.load(path)
-            assert self.idx == start
-            self.obses[start:end] = payload[0]
-            self.next_obses[start:end] = payload[1]
-            self.actions[start:end] = payload[2]
-            self.rewards[start:end] = payload[3]
-            self.not_dones[start:end] = payload[4]
-            self.idx = end
+        return wrap_env
+    else:
+        return None
 
 
-class FrameStack(gym.Wrapper):
-    def __init__(self, env, k):
-        gym.Wrapper.__init__(self, env)
-        self._k = k
-        self._frames = deque([], maxlen=k)
-        shp = env.observation_space.shape
-        self.observation_space = gym.spaces.Box(
-            low=0,
-            high=1,
-            shape=((shp[0] * k,) + shp[1:]),
-            dtype=env.observation_space.dtype
-        )
-        self._max_episode_steps = env._max_episode_steps
+def get_callback_list(hyperparams: Dict[str, Any]) -> List[BaseCallback]:
+    """
+    Get one or more Callback class specified as a hyper-parameter
+    "callback".
+    e.g.
+    callback: stable_baselines3.common.callbacks.CheckpointCallback
 
-    def reset(self):
-        obs = self.env.reset()
-        for _ in range(self._k):
-            self._frames.append(obs)
-        return self._get_obs()
+    for multiple, specify a list:
 
-    def step(self, action):
-        obs, reward, done, info = self.env.step(action)
-        self._frames.append(obs)
-        return self._get_obs(), reward, done, info
+    callback:
+        - utils.callbacks.PlotActionWrapper
+        - stable_baselines3.common.callbacks.CheckpointCallback
 
-    def _get_obs(self):
-        assert len(self._frames) == self._k
-        return np.concatenate(list(self._frames), axis=0)
+    :param hyperparams:
+    :return:
+    """
+
+    def get_module_name(callback_name):
+        return ".".join(callback_name.split(".")[:-1])
+
+    def get_class_name(callback_name):
+        return callback_name.split(".")[-1]
+
+    callbacks = []
+
+    if "callback" in hyperparams.keys():
+        callback_name = hyperparams.get("callback")
+
+        if callback_name is None:
+            return callbacks
+
+        if not isinstance(callback_name, list):
+            callback_names = [callback_name]
+        else:
+            callback_names = callback_name
+
+        # Handle multiple wrappers
+        for callback_name in callback_names:
+            # Handle keyword arguments
+            if isinstance(callback_name, dict):
+                assert len(callback_name) == 1, (
+                    "You have an error in the formatting "
+                    f"of your YAML file near {callback_name}. "
+                    "You should check the indentation."
+                )
+                callback_dict = callback_name
+                callback_name = list(callback_dict.keys())[0]
+                kwargs = callback_dict[callback_name]
+            else:
+                kwargs = {}
+            callback_module = importlib.import_module(get_module_name(callback_name))
+            callback_class = getattr(callback_module, get_class_name(callback_name))
+            callbacks.append(callback_class(**kwargs))
+
+    return callbacks
+
+
+def create_test_env(
+    env_id: str,
+    n_envs: int = 1,
+    stats_path: Optional[str] = None,
+    seed: int = 0,
+    log_dir: Optional[str] = None,
+    should_render: bool = True,
+    hyperparams: Optional[Dict[str, Any]] = None,
+    env_kwargs: Optional[Dict[str, Any]] = None,
+) -> VecEnv:
+    """
+    Create environment for testing a trained agent
+
+    :param env_id:
+    :param n_envs: number of processes
+    :param stats_path: path to folder containing saved running averaged
+    :param seed: Seed for random number generator
+    :param log_dir: Where to log rewards
+    :param should_render: For Pybullet env, display the GUI
+    :param hyperparams: Additional hyperparams (ex: n_stack)
+    :param env_kwargs: Optional keyword argument to pass to the env constructor
+    :return:
+    """
+    # Avoid circular import
+    from utils.exp_manager import ExperimentManager
+
+    # Create the environment and wrap it if necessary
+    env_wrapper = get_wrapper_class(hyperparams)
+
+    hyperparams = {} if hyperparams is None else hyperparams
+
+    if "env_wrapper" in hyperparams.keys():
+        del hyperparams["env_wrapper"]
+
+    vec_env_kwargs = {}
+    vec_env_cls = DummyVecEnv
+    if n_envs > 1 or (ExperimentManager.is_bullet(env_id) and should_render):
+        # HACK: force SubprocVecEnv for Bullet env
+        # as Pybullet envs does not follow gym.render() interface
+        vec_env_cls = SubprocVecEnv
+        # start_method = 'spawn' for thread safe
+
+    env = make_vec_env(
+        env_id,
+        n_envs=n_envs,
+        monitor_dir=log_dir,
+        seed=seed,
+        wrapper_class=env_wrapper,
+        env_kwargs=env_kwargs,
+        vec_env_cls=vec_env_cls,
+        vec_env_kwargs=vec_env_kwargs,
+    )
+
+    # Load saved stats for normalizing input and rewards
+    # And optionally stack frames
+    if stats_path is not None:
+        if hyperparams["normalize"]:
+            print("Loading running average")
+            print(f"with params: {hyperparams['normalize_kwargs']}")
+            path_ = os.path.join(stats_path, "vecnormalize.pkl")
+            if os.path.exists(path_):
+                env = VecNormalize.load(path_, env)
+                # Deactivate training and reward normalization
+                env.training = False
+                env.norm_reward = False
+            else:
+                raise ValueError(f"VecNormalize stats {path_} not found")
+
+        n_stack = hyperparams.get("frame_stack", 0)
+        if n_stack > 0:
+            print(f"Stacking {n_stack} frames")
+            env = VecFrameStack(env, n_stack)
+    return env
+
+
+def linear_schedule(initial_value: Union[float, str]) -> Callable[[float], float]:
+    """
+    Linear learning rate schedule.
+
+    :param initial_value: (float or str)
+    :return: (function)
+    """
+    if isinstance(initial_value, str):
+        initial_value = float(initial_value)
+
+    def func(progress_remaining: float) -> float:
+        """
+        Progress will decrease from 1 (beginning) to 0
+        :param progress_remaining: (float)
+        :return: (float)
+        """
+        return progress_remaining * initial_value
+
+    return func
+
+
+def get_trained_models(log_folder: str) -> Dict[str, Tuple[str, str]]:
+    """
+    :param log_folder: Root log folder
+    :return: Dict representing the trained agents
+    """
+    trained_models = {}
+    for algo in os.listdir(log_folder):
+        if not os.path.isdir(os.path.join(log_folder, algo)):
+            continue
+        for env_id in os.listdir(os.path.join(log_folder, algo)):
+            # Retrieve env name
+            env_id = env_id.split("_")[0]
+            trained_models[f"{algo}-{env_id}"] = (algo, env_id)
+    return trained_models
+
+
+def get_latest_run_id(log_path: str, env_id: str) -> int:
+    """
+    Returns the latest run number for the given log name and log path,
+    by finding the greatest number in the directories.
+
+    :param log_path: path to log folder
+    :param env_id:
+    :return: latest run number
+    """
+    max_run_id = 0
+    for path in glob.glob(os.path.join(log_path, env_id + "_[0-9]*")):
+        file_name = os.path.basename(path)
+        ext = file_name.split("_")[-1]
+        if env_id == "_".join(file_name.split("_")[:-1]) and ext.isdigit() and int(ext) > max_run_id:
+            max_run_id = int(ext)
+    return max_run_id
+
+
+def get_saved_hyperparams(
+    stats_path: str,
+    norm_reward: bool = False,
+    test_mode: bool = False,
+) -> Tuple[Dict[str, Any], str]:
+    """
+    :param stats_path:
+    :param norm_reward:
+    :param test_mode:
+    :return:
+    """
+    hyperparams = {}
+    if not os.path.isdir(stats_path):
+        stats_path = None
+    else:
+        config_file = os.path.join(stats_path, "config.yml")
+        if os.path.isfile(config_file):
+            # Load saved hyperparameters
+            with open(os.path.join(stats_path, "config.yml"), "r") as f:
+                hyperparams = yaml.load(f, Loader=yaml.UnsafeLoader)  # pytype: disable=module-attr
+            hyperparams["normalize"] = hyperparams.get("normalize", False)
+        else:
+            obs_rms_path = os.path.join(stats_path, "obs_rms.pkl")
+            hyperparams["normalize"] = os.path.isfile(obs_rms_path)
+
+        # Load normalization params
+        if hyperparams["normalize"]:
+            if isinstance(hyperparams["normalize"], str):
+                normalize_kwargs = eval(hyperparams["normalize"])
+                if test_mode:
+                    normalize_kwargs["norm_reward"] = norm_reward
+            else:
+                normalize_kwargs = {"norm_obs": hyperparams["normalize"], "norm_reward": norm_reward}
+            hyperparams["normalize_kwargs"] = normalize_kwargs
+    return hyperparams, stats_path
+
+
+class StoreDict(argparse.Action):
+    """
+    Custom argparse action for storing dict.
+
+    In: args1:0.0 args2:"dict(a=1)"
+    Out: {'args1': 0.0, arg2: dict(a=1)}
+    """
+
+    def __init__(self, option_strings, dest, nargs=None, **kwargs):
+        self._nargs = nargs
+        super(StoreDict, self).__init__(option_strings, dest, nargs=nargs, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        arg_dict = {}
+        for arguments in values:
+            key = arguments.split(":")[0]
+            value = ":".join(arguments.split(":")[1:])
+            # Evaluate the string as python code
+            arg_dict[key] = eval(value)
+        setattr(namespace, self.dest, arg_dict)

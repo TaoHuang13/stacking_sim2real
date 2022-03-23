@@ -14,15 +14,16 @@ def main():
     folder = os.path.dirname(os.path.abspath(__file__))
     writer = imageio.get_writer(os.path.join(folder, video_name), fps=10)
     while not done:
-        #action = env.action_space.sample()
-        action = env.get_oracle_action(obs)
-        print(env.get_dynamics_info())
-        env.change_dynamics_info()
+        action = env.action_space.sample()
+        #action = env.get_oracle_action(obs)
+        #env.change_dynamics_info()
         obs, reward, done, info = env.step(action)
+        #print(obs)
         img = env.render(mode="rgb_array")
         writer.append_data(img)
         plt.pause(0.1)
 
+        
     writer.close()
     env.close()
 

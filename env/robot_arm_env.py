@@ -280,7 +280,6 @@ class ArmPickAndPlace(ArmGoalEnv):
             # TODO: refer to https://github.com/rlworkgroup/metaworld/blob/master/metaworld/envs/mujoco/sawyer_xyz/v1/sawyer_bin_picking.py 
             gripper_pos = self.robot.get_eef_position()
             reachDist = np.linalg.norm(cur_pos - gripper_pos)
-
             distance_ = distance + reachDist
             reward = self._previous_distance - distance_
             self._previous_distance = distance_
@@ -528,13 +527,13 @@ class ArmStack(ArmPickAndPlace):
             object_rel_pos = object_pos - eef_pos
             obs = np.concatenate([obs, object_pos, object_rel_pos, object_euler, object_velp, object_velr])
             if self.n_object > 1:
-                goal_indicator = (np.argmax(self.goal[3*self.n_to_stack:]) == i)    # num of subgoals and goal: self.n_to_stack
+                goal_indicator = (np.argmax(self.goal[3:]) == i)    # num of subgoals and goal: self.n_to_stack
                 obs = np.concatenate([obs, [goal_indicator]])
             if self.object_dim is None:
                 self.object_dim = len(obs) - self.robot_dim
         for i in range(self.n_active_object, self.n_object):
             obs = np.concatenate([obs, -np.ones(self.object_dim)])
-        achieved_goal = np.concatenate([self._get_achieved_goal(), self.goal[3*self.n_to_stack:]])
+        achieved_goal = np.concatenate([self._get_achieved_goal(), self.goal[3:]])
         obs_dict = dict(observation=obs, achieved_goal=achieved_goal, desired_goal=self.goal.copy())
         return obs_dict
 
@@ -543,12 +542,16 @@ class ArmStack(ArmPickAndPlace):
             goal_idx = 0
             cur_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx])
         else:
-            goal_idx = np.where(self.goal[3*self.n_to_stack:] >= 1)[0]
-            cur_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx[0]])
-            cur_pos = list(cur_pos)
+            goal_idx = np.where(self.goal[3:] >= 1)[0]
+            cur_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx[-1]])
+
+            achieved_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx[0]])
+            self.achieved_subgoals = list(achieved_pos)
             for i in range(1, self.n_to_stack):
-                cur_pos_, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx[1]])
-                cur_pos.extend(list(cur_pos_))
+                achieved_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx[i]])
+                self.achieved_subgoals.extend(list(achieved_pos))
+            self.achieved_subgoals = np.concatenate([self.achieved_subgoals])
+
         return np.array(cur_pos)
 
     def _sample_goal(self):
@@ -556,19 +559,21 @@ class ArmStack(ArmPickAndPlace):
         #                  self.robot.base_pos[2] + 0.025 + (self.n_base + self.n_to_stack - 1) * 0.05])
         # goal = np.array([self.base_xy[0], self.base_xy[1],
         #                   self.robot.base_pos[2] + 0.025 + (self.n_base + i) * 0.05 for i in range(self.n_to_stack)])
-        goal = [self.base_xy[0], self.base_xy[1],
+        self.subgoals = [self.base_xy[0], self.base_xy[1],
                           self.robot.base_pos[2] + 0.025 + (self.n_base + 0) * 0.05]
         for i in range(1, self.n_to_stack):
-            goal.extend([self.base_xy[0], self.base_xy[1],
+            self.subgoals.extend([self.base_xy[0], self.base_xy[1],
                             self.robot.base_pos[2] + 0.025 + (self.n_base + i) * 0.05])
+        self.subgoals = np.array(self.subgoals)
 
         goal_onehot = np.zeros(self.n_object)
         #goal_idx = self.np_random.randint(self.n_base, self.n_active_object)
         goal_idxs = self.np_random.choice(range(self.n_base, self.n_active_object), self.n_to_stack, replace=False) 
-        goal_onehot[goal_idxs[:-1]] = 1
+        for i in range(self.n_to_stack):
+            goal_onehot[goal_idxs[i]] = i + 1
 
-        goal_onehot[goal_idxs[-1]] = 2
-        goal = np.concatenate([goal, goal_onehot])
+        goal_onehot[goal_idxs[-1]] = self.n_to_stack
+        goal = np.concatenate([self.subgoals[3*(self.n_to_stack-1):3*self.n_to_stack], goal_onehot])
         if self.reward_type == "sparse" and self.n_to_stack == 1 and \
                 self.n_base > 0 and self.np_random.uniform() < 0.5:
             self.robot.control(
@@ -601,11 +606,11 @@ class ArmStack(ArmPickAndPlace):
 
     def visualize_goals(self, goal):
         #goal_idx = np.argmax(goal[3:])
-        goal_idxes = np.where(goal[3*self.n_to_stack:] >= 1)[0]
+        goal_idxes = np.where(goal[3:] >= 1)[0]
         for i, goal_idx in enumerate(goal_idxes):
             # if self.body_goal is None:
             vis_id = self.p.createVisualShape(self.p.GEOM_SPHERE, radius=0.025, rgbaColor=COLOR[goal_idx % len(COLOR)] + [0.2])
-            self.body_goal = self.p.createMultiBody(0, baseVisualShapeIndex=vis_id, basePosition=goal[3*i:3*(i+1)])
+            self.body_goal = self.p.createMultiBody(0, baseVisualShapeIndex=vis_id, basePosition=self.subgoals[3*i:3*(i+1)])
             # else:
             #     self.p.resetBasePositionAndOrientation(self.body_goal, goal[3*(i-1):3*i], (0, 0, 0, 1))
             #     self.p.changeVisualShape(self.body_goal, -1, rgbaColor=COLOR[goal_idx[0] % len(COLOR)] + [0.2])
@@ -676,8 +681,8 @@ class ArmStack(ArmPickAndPlace):
         ]
 
     def compute_reward_and_info(self):
-        goal_pos = self.goal[:3*self.n_to_stack]
-        cur_pos = self._get_achieved_goal()
+        goal_pos = self.subgoals[:3*self.n_to_stack]
+        cur_pos = self.achieved_subgoals
         gripper_pos = self.robot.get_eef_position()
 
         subgoal_distances = self.subgoal_distances(cur_pos, goal_pos)
@@ -692,7 +697,7 @@ class ArmStack(ArmPickAndPlace):
             for _ in range(50):
                 self.p.stepSimulation()
             future_pos = self._get_achieved_goal()
-            if np.linalg.norm(future_pos - cur_pos) < 1e-3:
+            if np.linalg.norm(future_pos - cur_pos[3*(self.n_to_stack-1):3*self.n_to_stack]) < 1e-3:
                 is_stable = True
             self.p.restoreState(stateId=state_id)
             self.p.removeState(state_id)
