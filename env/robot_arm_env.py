@@ -20,7 +20,7 @@ class ArmGoalEnv(gym.Env):
         obs = self._get_obs()
         self.observation_space = spaces.Dict(dict(
             observation=spaces.Box(-np.inf, np.inf, shape=obs["observation"].shape, dtype=np.float32),
-            achieved_goal=spaces.Box(-np.inf, np.inf, shape=obs["desired_goal"].shape, dtype=np.float32),
+            achieved_goal=spaces.Box(-np.inf, np.inf, shape=obs["achieved_goal"].shape, dtype=np.float32),
             desired_goal=spaces.Box(-np.inf, np.inf, shape=obs["desired_goal"].shape, dtype=np.float32)
         ))
         self.action_space = spaces.Box(-1., 1., shape=(action_dim,))
@@ -453,7 +453,9 @@ class ArmStack(ArmPickAndPlace):
         self.base_xy = np.array([0, 0])
         self.cl_ratio = 0
         self.distance_threshold = 0.05
+        self.body_goals = [None for i in range(kwargs['n_object'])]  
         super(ArmStack, self).__init__(*args, **kwargs)
+        
 
     def _reset_sim(self):
         # todo: more distracting tasks, e.g. distracting towers
@@ -470,6 +472,10 @@ class ArmStack(ArmPickAndPlace):
         else:
             self.n_active_object = self.n_object
         self.n_base = self.np_random.randint(0, self.n_active_object - self.n_to_stack + 1)
+        # #test
+        # self.n_to_stack = 1
+        # self.n_active_object = 2
+        # self.n_base = 0
         base_and_other_position = np.array([[self.np_random.uniform(*self.robot.x_workspace),
                                              self.np_random.uniform(*self.robot.y_workspace),
                                              self.robot.base_pos[2] + 0.025]
@@ -526,39 +532,50 @@ class ArmStack(ArmPickAndPlace):
             object_velr *= self.dt * self.robot.num_substeps
             object_rel_pos = object_pos - eef_pos
             obs = np.concatenate([obs, object_pos, object_rel_pos, object_euler, object_velp, object_velr])
-            if self.n_object > 1:
-                goal_indicator = (np.argmax(self.goal[3:]) == i)    # num of subgoals and goal: self.n_to_stack
-                obs = np.concatenate([obs, [goal_indicator]])
+            # if self.n_object > 1:
+            #     goal_indicator = (np.argmax(self.goal[3:]) == i)    # num of subgoals and goal: self.n_to_stack
+            #     obs = np.concatenate([obs, [goal_indicator]])
             if self.object_dim is None:
                 self.object_dim = len(obs) - self.robot_dim
+
         for i in range(self.n_active_object, self.n_object):
             obs = np.concatenate([obs, -np.ones(self.object_dim)])
-        achieved_goal = np.concatenate([self._get_achieved_goal(), self.goal[3:]])
-        obs_dict = dict(observation=obs, achieved_goal=achieved_goal, desired_goal=self.goal.copy())
+        achieved_goal = self._get_achieved_goal()
+
+        obs_dict = dict(observation=obs, achieved_goal=achieved_goal, desired_goal=self.fake_goals.copy())
         return obs_dict
 
     def _get_achieved_goal(self):
+        fake_achieved_goal = np.zeros(3*self.n_active_object)
+        self.achieved_subgoals = np.zeros(3*self.n_to_stack)
+
         if self.n_active_object == 1:
+            # TODO
             goal_idx = 0
             cur_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx])
+            dist = np.linalg.norm(cur_pos - self.goal[:3])
+            reach = dist < self.distance_threshold
+            self.achieved_subgoals[goal_idx*3:(goal_idx+1)*3] = cur_pos
+            fake_achieved_goal = np.array(cur_pos)
         else:
-            goal_idx = np.where(self.goal[3:] >= 1)[0]
-            cur_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx[-1]])
+            goal_idx = self.goal_idxs
+                 # -1 for obstacle, 0 for unreached goal, 1 otherwise
+            reach = -1 * np.ones(self.n_active_object)
+            for i in range(self.n_to_stack):
+                cur_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx[i]])
+                self.achieved_subgoals[i*3:(i+1)*3] = cur_pos
+                dist = np.linalg.norm(cur_pos - self.goal[i*3:(i+1)*3])
+                is_reach = dist < self.distance_threshold
+                reach[goal_idx[i]] = is_reach
+                fake_achieved_goal[goal_idx[i]*3:(goal_idx[i]+1)*3] = cur_pos
 
-            achieved_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx[0]])
-            self.achieved_subgoals = list(achieved_pos)
-            for i in range(1, self.n_to_stack):
-                achieved_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idx[i]])
-                self.achieved_subgoals.extend(list(achieved_pos))
-            self.achieved_subgoals = np.concatenate([self.achieved_subgoals])
+            self.achieved_subgoals = np.concatenate([self.achieved_subgoals, reach])
 
-        return np.array(cur_pos)
+        return fake_achieved_goal.copy()
 
     def _sample_goal(self):
-        # goal = np.array([self.base_xy[0], self.base_xy[1],
-        #                  self.robot.base_pos[2] + 0.025 + (self.n_base + self.n_to_stack - 1) * 0.05])
-        # goal = np.array([self.base_xy[0], self.base_xy[1],
-        #                   self.robot.base_pos[2] + 0.025 + (self.n_base + i) * 0.05 for i in range(self.n_to_stack)])
+        self.fake_goals = np.zeros(self.n_active_object*3)
+
         self.subgoals = [self.base_xy[0], self.base_xy[1],
                           self.robot.base_pos[2] + 0.025 + (self.n_base + 0) * 0.05]
         for i in range(1, self.n_to_stack):
@@ -566,14 +583,18 @@ class ArmStack(ArmPickAndPlace):
                             self.robot.base_pos[2] + 0.025 + (self.n_base + i) * 0.05])
         self.subgoals = np.array(self.subgoals)
 
-        goal_onehot = np.zeros(self.n_object)
-        #goal_idx = self.np_random.randint(self.n_base, self.n_active_object)
+        goal_onehot = np.zeros(self.n_active_object)
+        mask = np.ones(self.n_active_object)
         goal_idxs = self.np_random.choice(range(self.n_base, self.n_active_object), self.n_to_stack, replace=False) 
+        self.goal_idxs = goal_idxs
         for i in range(self.n_to_stack):
             goal_onehot[goal_idxs[i]] = i + 1
+            mask[goal_idxs[i]] = 0
+            self.fake_goals[goal_idxs[i]*3:(goal_idxs[i]+1)*3] = self.subgoals[i*3:(i+1)*3]
+        self.goal_onehot = goal_onehot
 
-        goal_onehot[goal_idxs[-1]] = self.n_to_stack
-        goal = np.concatenate([self.subgoals[3*(self.n_to_stack-1):3*self.n_to_stack], goal_onehot])
+        goal = np.concatenate([self.subgoals, goal_onehot, mask])
+        self.fake_goals = np.concatenate([self.fake_goals, mask])
         if self.reward_type == "sparse" and self.n_to_stack == 1 and \
                 self.n_base > 0 and self.np_random.uniform() < 0.5:
             self.robot.control(
@@ -602,18 +623,50 @@ class ArmStack(ArmPickAndPlace):
                 self.blocks_id[goal_idx], all_block_positions[goal_idx], (0, 0, 0, 1)
             )
         self.visualize_goals(goal)
+
+        # expert strategy
+        self._waypoints = [[None] for i in range(self.n_to_stack)]
+        for i in range(self.n_to_stack):
+            waypoints = []
+            cur_pos, _ = self.p.getBasePositionAndOrientation(self.blocks_id[goal_idxs[i]])
+            pos_obj = np.array(cur_pos)
+            subgoal_pos = self.subgoals[i*3:(i+1)*3]
+
+            waypoints.append(np.array([pos_obj[0], pos_obj[1], pos_obj[2] + 0.06, 0.5]))
+            waypoints.append(np.array([pos_obj[0], pos_obj[1], pos_obj[2], 0.5]))
+            waypoints.append(np.array([pos_obj[0], pos_obj[1], pos_obj[2], -1]))
+            waypoints.append(np.array([pos_obj[0], pos_obj[1], subgoal_pos[2] + 0.06, -1]))
+            
+            waypoints.append(np.array([subgoal_pos[0], subgoal_pos[1], subgoal_pos[2] + 0.06, -1]))
+            waypoints.append(np.array([subgoal_pos[0], subgoal_pos[1], subgoal_pos[2] + 0.06, 0.5]))
+
+            self._waypoints[i] = waypoints.copy()
+        
+        # expert strategy
+        self.next_block_id = -1  
+        
         return goal
 
     def visualize_goals(self, goal):
         #goal_idx = np.argmax(goal[3:])
-        goal_idxes = np.where(goal[3:] >= 1)[0]
-        for i, goal_idx in enumerate(goal_idxes):
+        # goal_idxes = np.where(goal[3:] >= 1)[0]
+
+        for i, goal_idx in enumerate(self.goal_idxs):
             # if self.body_goal is None:
-            vis_id = self.p.createVisualShape(self.p.GEOM_SPHERE, radius=0.025, rgbaColor=COLOR[goal_idx % len(COLOR)] + [0.2])
-            self.body_goal = self.p.createMultiBody(0, baseVisualShapeIndex=vis_id, basePosition=self.subgoals[3*i:3*(i+1)])
-            # else:
-            #     self.p.resetBasePositionAndOrientation(self.body_goal, goal[3*(i-1):3*i], (0, 0, 0, 1))
-            #     self.p.changeVisualShape(self.body_goal, -1, rgbaColor=COLOR[goal_idx[0] % len(COLOR)] + [0.2])
+            #     vis_id = self.p.createVisualShape(self.p.GEOM_SPHERE, radius=0.025, rgbaColor=COLOR[goal_idx % len(COLOR)] + [0.2])
+            #     body_goal = self.p.createMultiBody(0, baseVisualShapeIndex=vis_id, basePosition=self.subgoals[3*i:3*(i+1)])
+            if self.body_goals[i] is None:
+                vis_id = self.p.createVisualShape(self.p.GEOM_SPHERE, radius=0.025, rgbaColor=COLOR[goal_idx % len(COLOR)] + [0.2])
+                self.body_goals[i] = self.p.createMultiBody(0, baseVisualShapeIndex=vis_id, basePosition=self.subgoals[3*i:3*(i+1)])  
+            else:
+                self.p.resetBasePositionAndOrientation(self.body_goals[i], self.subgoals[3*i:3*(i+1)], (0, 0, 0, 1))
+                self.p.changeVisualShape(self.body_goals[i], -1, rgbaColor=COLOR[goal_idx % len(COLOR)] + [0.2])
+
+        for i in range(len(self.goal_idxs), self.n_object):
+            if self.body_goals[i] is not None:
+                vis_id = self.p.getBodyUniqueId(self.body_goals[i])
+                self.p.removeBody(vis_id)
+                self.body_goals[i] = None
 
     def set_choice_prob(self, n_to_stack, prob):
         probs = self.n_to_stack_probs
@@ -628,6 +681,12 @@ class ArmStack(ArmPickAndPlace):
             if not visited[i]:
                 probs[i] = (1 - sum(prob)) / (len(visited) - len(n_to_stack))
         self.n_to_stack_probs = probs
+
+    def reset(self):
+        self._reset_sim()
+        self.goal = self._sample_goal().copy()
+        obs = self._get_obs()
+        return obs
 
     def sync_attr(self):
         goal_pos = self.goal[:3]
@@ -681,8 +740,8 @@ class ArmStack(ArmPickAndPlace):
         ]
 
     def compute_reward_and_info(self):
-        goal_pos = self.subgoals[:3*self.n_to_stack]
-        cur_pos = self.achieved_subgoals
+        goal_pos = self.goal[:3*self.n_to_stack]
+        cur_pos = self.achieved_subgoals[:3*self.n_to_stack]
         gripper_pos = self.robot.get_eef_position()
 
         subgoal_distances = self.subgoal_distances(cur_pos, goal_pos)
@@ -691,19 +750,19 @@ class ArmStack(ArmPickAndPlace):
 
         is_stable = False
         eef_threshold = 0.1 * (1 - self.cl_ratio) if self.n_to_stack == 1 else 0.1
-        if goal_distance < self.distance_threshold and eef_distance > eef_threshold:
-            # debug_obs1 = self._get_obs()
-            state_id = self.p.saveState()
-            for _ in range(50):
-                self.p.stepSimulation()
-            future_pos = self._get_achieved_goal()
-            if np.linalg.norm(future_pos - cur_pos[3*(self.n_to_stack-1):3*self.n_to_stack]) < 1e-3:
-                is_stable = True
-            self.p.restoreState(stateId=state_id)
-            self.p.removeState(state_id)
-            # debug_obs2 = self._get_obs()
-            # for k in debug_obs1.keys():
-            #     assert np.linalg.norm(debug_obs1[k] - debug_obs2[k]) < 1e-5, (k, debug_obs1[k] - debug_obs2[k])
+        # if goal_distance < self.distance_threshold and eef_distance > eef_threshold:
+        #     # debug_obs1 = self._get_obs()
+        #     state_id = self.p.saveState()
+        #     for _ in range(50):
+        #         self.p.stepSimulation()
+        #     future_pos = self._get_achieved_goal()
+        #     if np.linalg.norm(future_pos - cur_pos[3*(self.n_to_stack-1):3*self.n_to_stack]) < 1e-3:
+        #         is_stable = True
+        #     self.p.restoreState(stateId=state_id)
+        #     self.p.removeState(state_id)
+        #     # debug_obs2 = self._get_obs()
+        #     # for k in debug_obs1.keys():
+        #     #     assert np.linalg.norm(debug_obs1[k] - debug_obs2[k]) < 1e-5, (k, debug_obs1[k] - debug_obs2[k])
 
         if self.reward_type == "sparse":
             reward = float(is_stable)
@@ -713,15 +772,37 @@ class ArmStack(ArmPickAndPlace):
             stacked_reward = -np.sum([(d > self.distance_threshold).astype(np.float32) for d in subgoal_distances], axis=0)
             stacked_reward = np.asarray(stacked_reward)
             reward = stacked_reward.copy()
-            np.putmask(reward, reward == 0, self.gripper_pos_far_from_goals(goal_pos, gripper_pos))
+            #np.putmask(reward, reward == 0, self.gripper_pos_far_from_goals(goal_pos, gripper_pos))
 
+            is_success = True
             if stacked_reward != 0:
                 next_block_id = int(self.n_to_stack - np.abs(stacked_reward))
+
+                dist = np.linalg.norm(gripper_pos - self.achieved_subgoals[next_block_id*3: (next_block_id+1)*3])
+                dist += np.linalg.norm(self.achieved_subgoals[next_block_id*3: (next_block_id+1)*3] - goal_pos[next_block_id*3: (next_block_id+1)*3])     
+
                 assert 0 <= next_block_id < self.n_to_stack
-                reward -= .01 * np.linalg.norm(gripper_pos - goal_pos[next_block_id*3: (next_block_id+1)*3])
+                reward -= dist   
+                is_success = False
+
+            # next_block_id = 0
+            # if next_block_id != self.next_block_id:
+            #     # self.dist = self.dist_ratio * np.linalg.norm(gripper_pos - self.achieved_subgoals[next_block_id*3: (next_block_id+1)*3])
+            #     self.dist = np.linalg.norm(self.achieved_subgoals[next_block_id*3: (next_block_id+1)*3] - goal_pos[next_block_id*3: (next_block_id+1)*3])  
+            # assert 0 <= next_block_id < self.n_to_stack
+            # dist = np.linalg.norm(gripper_pos - self.achieved_subgoals[next_block_id*3: (next_block_id+1)*3])
+            # dist_ = np.linalg.norm(self.achieved_subgoals[next_block_id*3: (next_block_id+1)*3] - goal_pos[next_block_id*3: (next_block_id+1)*3])
+            # reward = - (dist_ + dist)
+            # self.dist = dist_
+            
+            # self.next_block_id = next_block_id
+
         else:
             raise NotImplementedError
-        is_success = is_stable
+        #is_success = is_stable
+        #is_success = dist < self.distance_threshold and next_block_id == self.n_to_stack - 1
+        # if is_success:
+        #     print('success')
         info = {'is_success': is_success, "n_to_stack": self.n_to_stack, "n_base": self.n_base}
         return reward, info
 
@@ -731,6 +812,29 @@ class ArmStack(ArmPickAndPlace):
 
     def set_cl_ratio(self, cl_ratio):
         self.cl_ratio = cl_ratio
+
+    def get_oracle_action(self, obs):
+        """
+        Hard-coded expert strategy
+        """
+        action = np.zeros(4)
+        for j, waypoints in enumerate(self._waypoints):
+            if waypoints is None:
+                continue
+            for i, waypoint in enumerate(waypoints):
+                if waypoint is None:
+                    continue
+                delta_pos = (waypoint[:3] - obs['observation'][:3]) / 0.15
+                delta_yaw = (waypoint[3] - obs['observation'][3]) 
+                action = np.array([delta_pos[0], delta_pos[1], delta_pos[2], delta_yaw])
+                if np.linalg.norm(delta_pos) < 5e-2:
+                    waypoints[i] = None
+                    if i == len(waypoints) - 1:
+                        self._waypoints[j] = None
+                break
+            break
+        
+        return action
 
 def _create_block(physics_client, halfExtents, pos, orn, mass=0.2, rgba=None, vel=None, vela=None):
     col_id = physics_client.createCollisionShape(physics_client.GEOM_BOX, halfExtents=halfExtents)
